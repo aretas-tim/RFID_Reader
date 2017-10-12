@@ -10,6 +10,8 @@
 
 //To Do:
 // Write something to handle repeated reads of RFID cards (Done)
+//write something to handle incomplete reads, and indicate them
+// write something to handle host connetion failure and connection status
 
 
 #include <ESP8266WiFi.h>
@@ -17,13 +19,13 @@
 #include "DebugMacros.h"
 
 #define enablePin  2   // Connects to the RFID's ENABLE pin
-//#define rxPin      10  // Serial input (connects to the RFID's SOUT pin)
-//#define txPin      11  // Serial output (unused)
-
 #define BUFSIZE    11  // Size of receive buffer (in bytes) (10-byte unique ID + null character)
-
+#define RFID_DATA_LENGTH 10 // size of RFID ID data length
 #define RFID_START  0x0A  // RFID Reader Start and Stop bytes
 #define RFID_STOP   0x0D
+#define RFID_DATA_LENGTH 10
+
+#define RECONNECTION_INTERVAL 10000
 
 // for stack analytics
 extern "C" {
@@ -31,37 +33,23 @@ extern "C" {
   extern cont_t g_cont;
 }
 
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+//!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 // Fill ssid and password with your network credentials
-const char* ssid = "JJ Bean Cambie";
-const char* password = "railtown";
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
+//const char* ssid = "JJ Bean Cambie";
+//const char* password = "railtown";
+//!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+const char* ssid = "basement949";
+const char* password = "bluehouse949";
 
 const char* host = "script.google.com";
-
 //const char *GScriptId = "AKfycbzGWh0-1yZGfYaW3cN2tAdPePnUUHn4kioSM0ryER2kuG0lXwU"; //tim's test sheet 
 const char *GScriptId = "AKfycbwouk1qPDc0V4I7qeNRaagVLp2FxFJzqOy8Z7fYCHRRA1jCP_C_"; //steven's actual sheet ID
-
-
 const int httpsPort = 443;
-
-
-
-
-
-
-
-
 String url = String("/macros/s/") + GScriptId + "/exec?value=-99";
-
-
 HTTPSRedirect* client = nullptr;
-// used to store the values of free stack and heap
-// before the HTTPSRedirect object is instantiated
-// so that they can be written to Google sheets
-// upon instantiation
 
+unsigned long now = 0;
+unsigned long previous_time = 0;
 
 void setup() {
   
@@ -132,6 +120,7 @@ void setup() {
   // delete HTTPSRedirect object
   delete client;
   client = nullptr;
+  now = millis();
 }
 
 void loop() {
@@ -147,7 +136,7 @@ void loop() {
   char offset = 0;         // Offset into buffer
   rfidData[0] = 0;         // Clear the buffer
   //prev_data[0] = 0;        // Clear prev data buffer
-
+  
   digitalWrite(enablePin, LOW);   // enable the RFID Reader
   
   if (!flag){
@@ -161,6 +150,7 @@ void loop() {
 
   if (client != nullptr){
     if (!client->connected()){
+      Serial.println("Client not connected. Reconnecting to client.");
       client->connect(host, httpsPort);
       
     }
@@ -178,9 +168,10 @@ void loop() {
     return;
   }
   
+  
   while(1)
-  {
-    if (Serial.available() > 0) // If there are any bytes available to read, then the RFID Reader has probably seen a valid tag
+  { 
+    if(Serial.available() > 0) // If there are any bytes available to read, then the RFID Reader has probably seen a valid tag
     {
       rfidData[offset] = Serial.read();  // Get the byte and store it in our buffer
       if (rfidData[offset] == RFID_START)    // If we receive the start byte from the RFID Reader, then get ready to receive the tag's unique ID
@@ -191,24 +182,51 @@ void loop() {
       {
         rfidData[offset] = 0; // Null terminate the string of bytes we just received
         
-        //If the incomming tag data isn't a repeat of the previous,
-        //save it in previous buffer, print to monitor an dsave to web
-        Serial.println(strcmp(rfidData, prev_data),DEC);
-        if(strcmp(rfidData, prev_data) != 0 ){
-            
-            url = String("/macros/s/") + GScriptId + "/exec?value="+rfidData;
-            // post data apended to the url
-            client->GET(url, host);
-            Serial.print("incomming tag:"); Serial.println(rfidData);       // The rfidData string should now contain the tag's unique ID with a null termination, so display it on the Serial Monitor
-            Serial.print("previous tag:");Serial.println(prev_data);
-            Serial.flush();
-            
+        now = millis();
+        if(now - previous_time > RECONNECTION_INTERVAL||previous_time == 0){
+            // check for wifi connetcion. if lost try to reconnect untill connection found
+            if(WiFi.status() != WL_CONNECTED) {
+                  Serial.println("Lost wifi connection. Reconnecting.");
+                  WiFi.begin(ssid, password);
+                  
+            }
+            while(WiFi.status() != WL_CONNECTED) {
+                  delay(500);
+                  Serial.print(".");
+            }
+    
+            //
+            if (!client->connected()){
+                 Serial.println("Client not connected. Reconnecting to client.");
+                 client->connect(host, httpsPort);
+            }
+            previous_time = now;
         }
-        
-        strcpy(prev_data, rfidData); //save the new tag into the previous tag buffer
-        break;                // Break out of the loop
+        //If the scanned code from RFID is 10 bytes long
+        if(strlen(rfidData) == RFID_DATA_LENGTH){
+            //If the scanned data is different than the Last scanned data then try and upload it to 
+            //the sheet
+            if(strcmp(rfidData, prev_data) != 0 ){
+                url = String("/macros/s/") + GScriptId + "/exec?value="+rfidData;
+                // post data apended to the url
+                //if (!client->connected()){
+                // Serial.println("Client not connected. Reconnecting to client.");
+                // client->connect(host, httpsPort);
+               // }
+                while(client->GET(url, host) != 1){
+                  Serial.println("Client not connected. Reconnecting to client.");
+                  client->connect(host, httpsPort);
+                 }
+                Serial.print("incomming tag:"); Serial.println(rfidData);       // The rfidData string should now contain the tag's unique ID with a null termination, so display it on the Serial Monitor
+                Serial.print("previous tag:");Serial.println(prev_data);
+                Serial.flush();
+                strcpy(prev_data, rfidData); //save the new tag into the previous tag buffer
+            }
+         }else{
+            Serial.println("ESP misread tag value.");
+         }
+         break;// Break out of the while(1); 
       }
-          
       offset++;  // Increment offset into array
       if (offset >= BUFSIZE) offset = 0; // If the incoming data string is longer than our buffer, wrap around to avoid going out-of-bounds
     }
