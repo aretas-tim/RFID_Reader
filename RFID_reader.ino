@@ -19,13 +19,16 @@
 #include "DebugMacros.h"
 
 #define enablePin  2   // Connects to the RFID's ENABLE pin
+#define LED_PIN    16
 #define BUFSIZE    11  // Size of receive buffer (in bytes) (10-byte unique ID + null character)
 #define RFID_DATA_LENGTH 10 // size of RFID ID data length
 #define RFID_START  0x0A  // RFID Reader Start and Stop bytes
 #define RFID_STOP   0x0D
 #define RFID_DATA_LENGTH 10
-
+//interval used to try reconnecting to wifi
 #define RECONNECTION_INTERVAL 10000
+//length the LEd is on after a succeful sheet upload
+#define LED_BLINK_INTERVAL    500
 
 // for stack analytics
 extern "C" {
@@ -50,19 +53,48 @@ HTTPSRedirect* client = nullptr;
 
 unsigned long now = 0;
 unsigned long previous_time = 0;
+unsigned long led_start_time = 0;
+
+static int error_count = 0;
+static int connect_count = 0;
+const unsigned int MAX_CONNECT = 20;
+static bool client_flag = false;
+//records wether the led is on or off (true == on)
+static bool led_flag = false;
+// Buffer for incoming data
+char rfidData[BUFSIZE]; 
+// a temporary buffer to help with making sure noise hasnt been read by the reader
+char temp_rfid[BUFSIZE];
+//Buffer to save the last read RFID data
+char prev_sheet_data[BUFSIZE];
+//used to index the array holding RFID tags 
+char offset = 0;
 
 void setup() {
   
+  //initialize Digital Port for confirmation LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  //initilize data arrays
+  rfidData[0] = 0;         // Clear the buffer
+  temp_rfid[0]=0;
+  prev_sheet_data[0]=0;
+
+  //initialize RFID reader
   pinMode(enablePin, OUTPUT);
   digitalWrite(enablePin, HIGH);  // disable RFID Reader
   
   Serial.begin(2400);
   Serial.flush();
+  Serial.println("started");
   
   //free_heap_before = ESP.getFreeHeap();
   //free_stack_before = cont_get_free_stack(&g_cont);
   //Serial.printf("Free heap before: %u\n", free_heap_before);
   //Serial.printf("unmodified stack   = %4d\n", free_stack_before);
+
+
   
   Serial.println();
   Serial.print("Connecting to wifi: ");
@@ -125,49 +157,52 @@ void setup() {
 
 void loop() {
   
-  static int error_count = 0;
-  static int connect_count = 0;
-  const unsigned int MAX_CONNECT = 20;
-  static bool flag = false;
-  // Wait for a response from the RFID Reader
-  // See Arduino readBytesUntil() as an alternative solution to read data from the reader
-  char rfidData[BUFSIZE];  // Buffer for incoming data
-  char prev_data[BUFSIZE]; //Buffer to save the last read RFID data
-  char offset = 0;         // Offset into buffer
-  rfidData[0] = 0;         // Clear the buffer
-  //prev_data[0] = 0;        // Clear prev data buffer
+  // enable the RFID Reader
+  digitalWrite(enablePin, LOW);   
   
-  digitalWrite(enablePin, LOW);   // enable the RFID Reader
-  
-  if (!flag){
+  if (!client_flag)
+  {
     //free_heap_before = ESP.getFreeHeap();
     //free_stack_before = cont_get_free_stack(&g_cont);
     client = new HTTPSRedirect(httpsPort);
-    flag = true;
+    client_flag = true;
     client->setPrintResponseBody(true);
     client->setContentTypeHeader("application/json");
   }
 
-  if (client != nullptr){
-    if (!client->connected()){
+  if (client != nullptr)
+  {
+    if (!client->connected())
+    {
       Serial.println("Client not connected. Reconnecting to client.");
       client->connect(host, httpsPort);
       
     }
-  }
-  else{
+  }else{
     DPRINTLN("Error creating client object!");
     error_count = 5;
   }
   
-  if (connect_count > MAX_CONNECT){
+  if (connect_count > MAX_CONNECT)
+  {
     //error_count = 5;
     connect_count = 0;
-    flag = false;
+    client_flag = false;
     delete client;
     return;
   }
   
+  //If the LED is on and it has been on longer than the blink interval, turn it off
+  if(led_flag)
+  {
+    now = millis();
+    if(now - led_start_time > LED_BLINK_INTERVAL)
+    {
+        led_flag = false;
+        digitalWrite(LED_PIN, LOW);
+    }
+  }
+
   
   while(1)
   { 
@@ -190,45 +225,67 @@ void loop() {
                   WiFi.begin(ssid, password);
                   
             }
-            while(WiFi.status() != WL_CONNECTED) {
+            while(WiFi.status() != WL_CONNECTED)
+            {
                   delay(500);
                   Serial.print(".");
             }
-    
-            //
-            if (!client->connected()){
+            if (!client->connected())
+            {
                  Serial.println("Client not connected. Reconnecting to client.");
                  client->connect(host, httpsPort);
             }
             previous_time = now;
         }
         //If the scanned code from RFID is 10 bytes long
-        if(strlen(rfidData) == RFID_DATA_LENGTH){
-            //If the scanned data is different than the Last scanned data then try and upload it to 
-            //the sheet
-            if(strcmp(rfidData, prev_data) != 0 ){
-                url = String("/macros/s/") + GScriptId + "/exec?value="+rfidData;
-                // post data apended to the url
-                //if (!client->connected()){
-                // Serial.println("Client not connected. Reconnecting to client.");
-                // client->connect(host, httpsPort);
-               // }
-                while(client->GET(url, host) != 1){
-                  Serial.println("Client not connected. Reconnecting to client.");
-                  client->connect(host, httpsPort);
-                 }
-                Serial.print("incomming tag:"); Serial.println(rfidData);       // The rfidData string should now contain the tag's unique ID with a null termination, so display it on the Serial Monitor
-                Serial.print("previous tag:");Serial.println(prev_data);
-                Serial.flush();
-                strcpy(prev_data, rfidData); //save the new tag into the previous tag buffer
+        if(strlen(rfidData) == RFID_DATA_LENGTH)
+        {
+            //If the new RFID data is the same as the last read data then we know its not noise
+            // and a good reading
+            Serial.print("new tag:"); Serial.println(rfidData);       
+            Serial.print("temp value:");Serial.println(prev_sheet_data);
+            if(strcmp(rfidData, temp_rfid) == 0)
+            {
+                //If new rfid data is different than the last data uploaded to 
+                //the sheet, so we want to upload it.
+                if(strcmp(rfidData, prev_sheet_data) != 0 )
+                {
+                    //turn the LED on signaling a write to google sheets
+                    digitalWrite(LED_PIN,HIGH);
+                    led_start_time = millis();
+                    led_flag = true;
+                    
+                    url = String("/macros/s/") + GScriptId + "/exec?value="+rfidData;
+                    while(client->GET(url, host) != 1)
+                    {
+                      Serial.println("Client not connected. Reconnecting to client.");
+                      client->connect(host, httpsPort);
+                     }
+
+                     
+                      
+                    // The rfidData string should now contain the tag's unique ID with a null termination, so display it on the Serial Monitor
+                    Serial.print("new value to write to sheet:"); Serial.println(rfidData);       
+                    Serial.print("last value written to sheet:");Serial.println(prev_sheet_data);
+                    Serial.flush();
+                    //save the new tag into the previous tag buffer
+                    strcpy(prev_sheet_data, rfidData); 
+                }
+                //save newest RFID code into temp array
+                strcpy(temp_rfid,rfidData);
+            }else{
+                //save newest RFID code into temp array
+                strcpy(temp_rfid,rfidData);
             }
          }else{
-            Serial.println("ESP misread tag value.");
+             Serial.println("ESP misread tag value.");
          }
          break;// Break out of the while(1); 
       }
-      offset++;  // Increment offset into array
-      if (offset >= BUFSIZE) offset = 0; // If the incoming data string is longer than our buffer, wrap around to avoid going out-of-bounds
+      // Increment offset into array
+      offset++;
+      // If the incoming data string is longer than our buffer, wrap around to avoid going out-of-bounds  
+      if (offset >= BUFSIZE) offset = 0; 
     }
   }
 
